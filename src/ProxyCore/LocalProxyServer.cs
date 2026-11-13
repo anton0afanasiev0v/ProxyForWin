@@ -1,0 +1,527 @@
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace ProxyForWin.Core;
+
+using Tunnel = UpstreamConnector.Tunnel;
+
+public enum ClientRequestKind
+{
+    Connect,
+    HttpProxy,
+    Transparent,
+}
+
+public sealed record ClientRequest(
+    ClientRequestKind Kind,
+    string? Host,
+    int Port,
+    int HeaderLength);
+
+/// <summary>
+/// Local HTTP proxy on 127.0.0.1 (system-proxy mode) and on all interfaces
+/// (full-traffic mode, where WinDivert reflects connections into it).
+///
+/// Supports:
+///   * CONNECT host:port  (HTTPS and everything else) with upstream auth;
+///   * absolute-form HTTP requests (GET http://host/...);
+///   * transparent mode, where the destination is taken from the NAT table
+///     and the host name is sniffed from TLS SNI / HTTP Host.
+/// </summary>
+public sealed class LocalProxyServer : IAsyncDisposable
+{
+    private const int MaxPrefixBytes = 32 * 1024;
+    private const int SniffBytes = 2048;
+    private static readonly TimeSpan SniffTimeout = TimeSpan.FromMilliseconds(700);
+
+    private readonly ProxySettings _settings;
+    private readonly BypassList _bypass;
+    private readonly Logger _log;
+    private readonly NatTable? _nat;
+    private readonly UpstreamConnector _connector;
+    private readonly object _sync = new();
+
+    private TcpListener? _listener;
+    private CancellationTokenSource? _cts;
+    private Task? _acceptTask;
+
+    private long _connections;
+    private long _active;
+    private long _bytesUp;
+    private long _bytesDown;
+
+    public LocalProxyServer(ProxySettings settings, BypassList bypass, Logger log, NatTable? nat)
+    {
+        _settings = settings;
+        _bypass = bypass;
+        _log = log;
+        _nat = nat;
+        _connector = new UpstreamConnector(settings, log);
+    }
+
+    public bool IsRunning => _listener is not null;
+
+    public int ListenPort => _settings.ListenPort;
+
+    public long TotalConnections => Interlocked.Read(ref _connections);
+
+    public long ActiveConnections => Interlocked.Read(ref _active);
+
+    public long BytesUp => Interlocked.Read(ref _bytesUp);
+
+    public long BytesDown => Interlocked.Read(ref _bytesDown);
+
+    public bool IsTransparent => _nat is not null;
+
+    public Task StartAsync()
+    {
+        lock (_sync)
+        {
+            if (_listener is not null)
+            {
+                return Task.CompletedTask;
+            }
+
+            var listener = new TcpListener(_nat is null ? IPAddress.Loopback : IPAddress.Any, _settings.ListenPort)
+            {
+                ExclusiveAddressUse = false,
+            };
+            listener.Server.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+            listener.Start(512);
+
+            _listener = listener;
+            _cts = new CancellationTokenSource();
+            _acceptTask = Task.Run(() => AcceptLoopAsync(listener, _cts.Token));
+        }
+
+        _log.Info($"Локальный прокси запущен на порту {_settings.ListenPort}" +
+                  (_nat is null ? " (режим системного прокси)" : " (режим полного перехвата)"));
+        return Task.CompletedTask;
+    }
+
+    public async Task StopAsync()
+    {
+        TcpListener? listener;
+        CancellationTokenSource? cts;
+        Task? acceptTask;
+
+        lock (_sync)
+        {
+            listener = _listener;
+            cts = _cts;
+            acceptTask = _acceptTask;
+            _listener = null;
+            _cts = null;
+            _acceptTask = null;
+        }
+
+        if (listener is null)
+        {
+            return;
+        }
+
+        try
+        {
+            cts?.Cancel();
+            listener.Stop();
+        }
+        catch
+        {
+            // ignored
+        }
+
+        if (acceptTask is not null)
+        {
+            try
+            {
+                await acceptTask.ConfigureAwait(false);
+            }
+            catch
+            {
+                // ignored
+            }
+        }
+
+        cts?.Dispose();
+        _log.Info("Локальный прокси остановлен");
+    }
+
+    private async Task AcceptLoopAsync(TcpListener listener, CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await listener.AcceptTcpClientAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (ObjectDisposedException)
+            {
+                break;
+            }
+            catch (SocketException ex)
+            {
+                if (ct.IsCancellationRequested)
+                {
+                    break;
+                }
+
+                _log.Warn("Ошибка accept: " + ex.Message);
+                continue;
+            }
+
+            _ = Task.Run(() => HandleClientAsync(client, ct), CancellationToken.None);
+        }
+    }
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    {
+        var remote = client.Client.RemoteEndPoint as IPEndPoint;
+        Interlocked.Increment(ref _connections);
+        Interlocked.Increment(ref _active);
+
+        Tunnel? tunnel = null;
+        try
+        {
+            client.NoDelay = true;
+            using var stream = client.GetStream();
+
+            if (!IsClientAllowed(remote))
+            {
+                _log.Warn($"Отклонено подключение с {remote}");
+                return;
+            }
+
+            var prefix = await ReadPrefixAsync(stream, ct).ConfigureAwait(false);
+            if (prefix.Length == 0)
+            {
+                return;
+            }
+
+            var request = ParseRequest(prefix, remote);
+            if (request is null)
+            {
+                _log.Debug($"Не удалось разобрать запрос от {remote}");
+                return;
+            }
+
+            var hostname = request.Host;
+            if (request.Kind == ClientRequestKind.Transparent && !_bypass.HasDomainRules)
+            {
+                hostname = null; // no need to sniff anything
+            }
+            else if (request.Kind == ClientRequestKind.Transparent)
+            {
+                hostname = SniffHostname(prefix) ?? request.Host;
+            }
+
+            var bypass = IsBypassed(hostname, request.Host);
+            var useUpstream = _settings.HasUpstream && !bypass;
+
+            _log.Debug($"{(request.Kind == ClientRequestKind.Transparent ? "transparent" : request.Kind.ToString())} " +
+                       $"{request.Host}:{request.Port} -> {(_settings.UpstreamEndpoint)}" +
+                       (bypass ? " (bypass)" : ""));
+
+            tunnel = await _connector.ConnectAsync(request.Host!, request.Port, useUpstream, ct).ConfigureAwait(false);
+
+            if (request.Kind == ClientRequestKind.Connect)
+            {
+                var response = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\nProxy-Agent: ProxyForWin\r\n\r\n");
+                await stream.WriteAsync(response, ct).ConfigureAwait(false);
+            }
+
+            var buffered = request.Kind == ClientRequestKind.Connect
+                ? prefix[request.HeaderLength..]
+                : prefix;
+            using var upstream = new NetworkStream(tunnel.Socket, ownsSocket: false);
+
+            if (tunnel.Leftover.Length > 0)
+            {
+                await stream.WriteAsync(tunnel.Leftover, ct).ConfigureAwait(false);
+                Interlocked.Add(ref _bytesDown, tunnel.Leftover.Length);
+            }
+
+            if (buffered.Length > 0)
+            {
+                await upstream.WriteAsync(buffered, ct).ConfigureAwait(false);
+                Interlocked.Add(ref _bytesUp, buffered.Length);
+            }
+
+            await RelayAsync(stream, upstream, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // shutdown
+        }
+        catch (Exception ex)
+        {
+            _log.Debug("Ошибка обработки соединения: " + ex.Message);
+        }
+        finally
+        {
+            tunnel?.Dispose();
+            try
+            {
+                client.Dispose();
+            }
+            catch
+            {
+                // ignored
+            }
+
+            Interlocked.Decrement(ref _active);
+        }
+    }
+
+    private bool IsClientAllowed(IPEndPoint? remote)
+    {
+        if (remote is null)
+        {
+            return false;
+        }
+
+        if (IPAddress.IsLoopback(remote.Address))
+        {
+            return true;
+        }
+
+        // In full-traffic mode the source address is spoofed by the redirector,
+        // but the connection must exist in the NAT table.
+        if (_nat is not null)
+        {
+            var bytes = remote.Address.GetAddressBytes();
+            if (bytes.Length == 4)
+            {
+                var address = BinaryPrimitives.ReadUInt32BigEndian(bytes);
+                return _nat.Contains(address, (ushort)remote.Port);
+            }
+        }
+
+        return false;
+    }
+
+    private ClientRequest? ParseRequest(ReadOnlySpan<byte> prefix, IPEndPoint? remote)
+    {
+        if (HttpUtil.LooksLikeHttpRequest(prefix))
+        {
+            var headerEnd = HttpUtil.IndexOfHeaderEnd(prefix);
+            if (headerEnd < 0)
+            {
+                return null;
+            }
+
+            var headers = Encoding.ASCII.GetString(prefix[..headerEnd]);
+            var firstLine = headers.Split("\r\n", 2)[0];
+            var parts = firstLine.Split(' ');
+
+            if (parts.Length >= 3 && parts[0].Equals("CONNECT", StringComparison.OrdinalIgnoreCase))
+            {
+                return HttpUtil.TryParseAuthority(parts[1], 443, out var host, out var port)
+                    ? new ClientRequest(ClientRequestKind.Connect, host, port, headerEnd)
+                    : null;
+            }
+
+            if (parts.Length >= 3 && HttpUtil.TryParseAbsoluteUri(parts[1], out var absHost, out var absPort))
+            {
+                return new ClientRequest(ClientRequestKind.HttpProxy, absHost, absPort, headerEnd);
+            }
+
+            // Origin-form request sent to the proxy: use the Host header.
+            var hostHeader = HttpUtil.GetHeader(headers, "Host");
+            if (hostHeader is not null && HttpUtil.TryParseAuthority(hostHeader, 80, out var hostFromHeader, out var portFromHeader))
+            {
+                return new ClientRequest(ClientRequestKind.HttpProxy, hostFromHeader, portFromHeader, headerEnd);
+            }
+
+            return null;
+        }
+
+        // Transparent mode: destination comes from the WinDivert NAT table.
+        if (_nat is not null && remote is not null)
+        {
+            var bytes = remote.Address.GetAddressBytes();
+            if (bytes.Length != 4)
+            {
+                return null;
+            }
+
+            var address = BinaryPrimitives.ReadUInt32BigEndian(bytes);
+            if (!_nat.TryGetTarget(address, (ushort)remote.Port, out var targetPort))
+            {
+                return null;
+            }
+
+            return new ClientRequest(ClientRequestKind.Transparent, remote.Address.ToString(), targetPort, 0);
+        }
+
+        return null;
+    }
+
+    private bool IsBypassed(string? hostname, string? ipHost)
+    {
+        if (_bypass.MatchesHost(hostname))
+        {
+            return true;
+        }
+
+        if (IPAddress.TryParse(ipHost, out var ip) && _bypass.MatchesIp(ip))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string? SniffHostname(ReadOnlySpan<byte> prefix)
+    {
+        if (prefix.Length >= 5 && prefix[0] == 0x16 && prefix[1] == 0x03)
+        {
+            var sni = TlsSniParser.TryGetServerName(prefix);
+            if (!string.IsNullOrEmpty(sni))
+            {
+                return sni;
+            }
+        }
+
+        if (HttpUtil.LooksLikeHttpRequest(prefix))
+        {
+            var text = Encoding.ASCII.GetString(prefix);
+            var headerEnd = text.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+            var headers = headerEnd >= 0 ? text[..headerEnd] : text;
+            return HttpUtil.GetHeader(headers, "Host")?.Split(':')[0];
+        }
+
+        return null;
+    }
+
+    private static async Task<byte[]> ReadPrefixAsync(NetworkStream stream, CancellationToken ct)
+    {
+        var buffer = new byte[MaxPrefixBytes];
+        var total = 0;
+
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(SniffTimeout);
+
+        try
+        {
+            while (total < buffer.Length)
+            {
+                var n = await stream.ReadAsync(buffer.AsMemory(total), timeout.Token).ConfigureAwait(false);
+                if (n == 0)
+                {
+                    break;
+                }
+
+                total += n;
+
+                if (IsPrefixComplete(buffer, total))
+                {
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Sniff window expired; use whatever arrived.
+        }
+
+        return buffer[..total];
+    }
+
+    private static bool IsPrefixComplete(byte[] buffer, int total)
+    {
+        var span = buffer.AsSpan(0, total);
+
+        if (HttpUtil.LooksLikeHttpRequest(span))
+        {
+            return HttpUtil.IndexOfHeaderEnd(span) >= 0;
+        }
+
+        return IsCompleteTlsRecord(span) || total >= SniffBytes;
+    }
+
+    private static bool IsCompleteTlsRecord(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 5 || data[0] != 0x16)
+        {
+            return false;
+        }
+
+        var length = (data[3] << 8) | data[4];
+        return data.Length >= 5 + length;
+    }
+
+    private async Task RelayAsync(NetworkStream client, NetworkStream upstream, CancellationToken ct)
+    {
+        var up = PumpAsync(client, upstream, n => Interlocked.Add(ref _bytesUp, n), ct);
+        var down = PumpAsync(upstream, client, n => Interlocked.Add(ref _bytesDown, n), ct);
+
+        var first = await Task.WhenAny(up, down).ConfigureAwait(false);
+        try
+        {
+            await first.ConfigureAwait(false);
+        }
+        catch
+        {
+            // ignored
+        }
+
+        ShutdownSend(client);
+        ShutdownSend(upstream);
+
+        var second = ReferenceEquals(first, up) ? down : up;
+        await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(5), ct)).ConfigureAwait(false);
+    }
+
+    private static async Task PumpAsync(Stream from, Stream to, Action<int> onBytes, CancellationToken ct)
+    {
+        var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+        try
+        {
+            while (true)
+            {
+                var n = await from.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false);
+                if (n == 0)
+                {
+                    break;
+                }
+
+                await to.WriteAsync(buffer.AsMemory(0, n), ct).ConfigureAwait(false);
+                onBytes(n);
+            }
+        }
+        catch
+        {
+            // Connection reset/timeout: stop pumping.
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+            ShutdownSend(to);
+        }
+    }
+
+    private static void ShutdownSend(Stream stream)
+    {
+        try
+        {
+            if (stream is NetworkStream ns && ns.Socket.Connected)
+            {
+                ns.Socket.Shutdown(SocketShutdown.Send);
+            }
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    public async ValueTask DisposeAsync() => await StopAsync().ConfigureAwait(false);
+}
