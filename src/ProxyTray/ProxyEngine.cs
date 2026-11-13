@@ -51,6 +51,46 @@ public sealed class ProxyEngine : IDisposable
         }
     }
 
+    /// <summary>Compact one-line summary for the tray tooltip, refreshed by a timer.</summary>
+    public string StatsText
+    {
+        get
+        {
+            var proxy = _proxy;
+            if (proxy is null)
+            {
+                return string.Empty;
+            }
+
+            var text = $"TCP: {proxy.TotalConnections} (активно {proxy.ActiveConnections}), " +
+                       $"трафик {FormatBytes(proxy.BytesUp)}↑ / {FormatBytes(proxy.BytesDown)}↓";
+
+            var redirector = _redirector;
+            if (redirector is not null)
+            {
+                text += $", UDP-блок: {redirector.DroppedQuic}, " +
+                        $"IPv6-блок: {redirector.DroppedIpv6}, VPN-пропуск: {redirector.PassedVpnPackets}";
+            }
+
+            return text;
+        }
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        const long kb = 1024;
+        const long mb = kb * 1024;
+        const long gb = mb * 1024;
+
+        return bytes switch
+        {
+            >= gb => $"{bytes / (double)gb:F1} ГБ",
+            >= mb => $"{bytes / (double)mb:F1} МБ",
+            >= kb => $"{bytes / (double)kb:F0} КБ",
+            _ => $"{bytes} Б",
+        };
+    }
+
     public async Task StartAsync()
     {
         lock (_gate)
@@ -67,17 +107,24 @@ public sealed class ProxyEngine : IDisposable
         }
 
         var settings = _settings.Clone();
+        _log.Verbose = settings.VerboseLog;
+
         var bypass = new BypassList(settings.Bypass);
+        // VPN endpoints are an explicit list: private ranges must not be exempt from
+        // the QUIC/IPv6 blockers unless the user actually named them.
+        var vpn = new BypassList(settings.VpnEndpoints, includePrivateRanges: false);
         var nat = settings.Mode == ProxyMode.FullTraffic ? new NatTable() : null;
-        var proxy = new LocalProxyServer(settings, bypass, _log, nat);
+        var proxy = new LocalProxyServer(settings, bypass, _log, nat, vpn);
 
         await proxy.StartAsync().ConfigureAwait(false);
+
+        LogEffectiveConfig(settings, vpn);
 
         try
         {
             if (settings.Mode == ProxyMode.FullTraffic)
             {
-                var redirector = new Redirector(settings, bypass, nat!, _log);
+                var redirector = new Redirector(settings, bypass, vpn, nat!, _log);
                 redirector.Start();
                 _redirector = redirector;
                 FirewallManager.EnsureRule(settings.ListenPort, _log);
@@ -130,6 +177,26 @@ public sealed class ProxyEngine : IDisposable
         }
 
         Changed?.Invoke();
+    }
+
+    /// <summary>
+    /// Writes the effective configuration once at startup. Credentials are never
+    /// logged — only whether they are set — and IPv6 addresses are counted, not printed.
+    /// </summary>
+    private void LogEffectiveConfig(ProxySettings settings, BypassList vpn)
+    {
+        var login = string.IsNullOrEmpty(settings.Username) ? "не задан" : "задан";
+        var password = string.IsNullOrEmpty(settings.Password) ? "не задан" : "задан";
+
+        _log.Info($"Настройки: upstream {settings.UpstreamEndpoint}, " +
+                  $"логин {login}, пароль {password}, локальный порт {settings.ListenPort}");
+        _log.Info($"Исключения: {settings.Bypass.Count}, VPN-серверы: {settings.VpnEndpoints.Count}" +
+                  (vpn.Count == 0
+                      ? " (UDP/443 и IPv6 для VPN будут блокироваться)"
+                      : string.Empty));
+        _log.Info($"QUIC (UDP/443): {(settings.BlockQuic ? "блокируется" : "разрешён")}, " +
+                  $"IPv6: {(settings.BlockIpv6 ? "блокируется" : "разрешён")}, " +
+                  $"подробный журнал: {(settings.VerboseLog ? "включён" : "выключен")}");
     }
 
     public async Task StopAsync()
@@ -196,6 +263,7 @@ public sealed class ProxyEngine : IDisposable
         }
 
         _settings = settings;
+        _log.Verbose = settings.VerboseLog;
 
         if (wasRunning)
         {

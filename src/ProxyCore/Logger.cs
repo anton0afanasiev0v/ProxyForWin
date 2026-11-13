@@ -18,6 +18,9 @@ public sealed class Logger
 
     public event Action<LogEntry>? EntryWritten;
 
+    /// <summary>When true, DEBUG entries are also written to the log file.</summary>
+    public bool Verbose { get; set; }
+
     public Logger(string? filePath = null)
     {
         _filePath = filePath;
@@ -55,7 +58,7 @@ public sealed class Logger
             _recent.TryDequeue(out _);
         }
 
-        if (level != "DEBUG")
+        if (level != "DEBUG" || Verbose)
         {
             var path = _filePath;
             if (!string.IsNullOrEmpty(path))

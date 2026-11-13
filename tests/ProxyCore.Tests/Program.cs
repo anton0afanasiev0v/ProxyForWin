@@ -20,10 +20,14 @@ internal static class Program
         PacketRewriterTests();
         NatTableTests();
         SniParserTests();
+        LogThrottleTests();
         SettingsStoreTests();
         await LocalProxyConnectTest();
         await LocalProxyTransparentTest();
+        await LocalProxyTransparentSniTest();
+        await LocalProxyVpnEndpointTest();
         await LocalProxyAbsoluteFormTest();
+        await UpstreamRejectedTest();
 
         Console.WriteLine();
         Console.WriteLine($"Пройдено: {_passed}, провалено: {_failed}");
@@ -122,6 +126,16 @@ internal static class Program
         var hello = BuildClientHello("secure.example.org");
         Check("sni parsed", TlsSniParser.TryGetServerName(hello) == "secure.example.org");
         Check("sni null on garbage", TlsSniParser.TryGetServerName(new byte[] { 1, 2, 3, 4, 5 }) is null);
+    }
+
+    private static void LogThrottleTests()
+    {
+        var throttle = new LogThrottle(TimeSpan.FromMilliseconds(200));
+        Check("throttle allows first", throttle.ShouldLog("dest"));
+        Check("throttle suppresses repeat", !throttle.ShouldLog("dest"));
+        Check("throttle independent keys", throttle.ShouldLog("other"));
+        throttle.Clear();
+        Check("throttle clear", throttle.ShouldLog("dest"));
     }
 
     private static void SettingsStoreTests()
@@ -243,6 +257,94 @@ internal static class Program
         }
     }
 
+    private static async Task LocalProxyTransparentSniTest()
+    {
+        var fakeProxy = new FakeHttpProxy();
+        var proxyPort = GetFreePort();
+        fakeProxy.Start(proxyPort);
+
+        var listenPort = GetFreePort();
+        var nat = new NatTable();
+        var settings = new ProxySettings
+        {
+            UpstreamHost = "127.0.0.1",
+            UpstreamPort = proxyPort,
+            ListenPort = listenPort,
+        };
+
+        var logger = new Logger();
+        await using var server = new LocalProxyServer(settings, new BypassList(Array.Empty<string>(), includePrivateRanges: false), logger, nat);
+        await server.StartAsync();
+
+        const int appPort = 40124;
+        try
+        {
+            using var client = new TcpClient(new IPEndPoint(IPAddress.Loopback, appPort));
+            nat.Register(ParseIp("127.0.0.1"), appPort, 8443);
+
+            await client.ConnectAsync(IPAddress.Loopback, listenPort);
+            var stream = client.GetStream();
+
+            var hello = BuildClientHello("secure.example.org");
+            await stream.WriteAsync(hello);
+            var echoed = await ReadExactlyBytesAsync(stream, hello.Length, TimeSpan.FromSeconds(10));
+            Check("transparent tls relayed", echoed.AsSpan().SequenceEqual(hello));
+            Check("transparent SNI used as CONNECT target", fakeProxy.LastTarget == "secure.example.org:8443");
+        }
+        finally
+        {
+            await server.StopAsync();
+            fakeProxy.Stop();
+        }
+    }
+
+    private static async Task LocalProxyVpnEndpointTest()
+    {
+        var fakeProxy = new FakeHttpProxy();
+        var proxyPort = GetFreePort();
+        fakeProxy.Start(proxyPort);
+
+        var listenPort = GetFreePort();
+        var nat = new NatTable();
+        var settings = new ProxySettings
+        {
+            UpstreamHost = "127.0.0.1",
+            UpstreamPort = proxyPort,
+            ListenPort = listenPort,
+        };
+
+        var logger = new Logger();
+        var vpn = new BypassList(new[] { "127.0.0.1" }, includePrivateRanges: false);
+        await using var server = new LocalProxyServer(
+            settings,
+            new BypassList(Array.Empty<string>(), includePrivateRanges: false),
+            logger,
+            nat,
+            vpn);
+        await server.StartAsync();
+
+        const int appPort = 40125;
+        try
+        {
+            using var client = new TcpClient(new IPEndPoint(IPAddress.Loopback, appPort));
+            nat.Register(ParseIp("127.0.0.1"), appPort, 8443);
+
+            await client.ConnectAsync(IPAddress.Loopback, listenPort);
+            var stream = client.GetStream();
+
+            // Reality-style decoy SNI must not become the CONNECT target.
+            var hello = BuildClientHello("decoy.example.com");
+            await stream.WriteAsync(hello);
+            await ReadExactlyBytesAsync(stream, hello.Length, TimeSpan.FromSeconds(10));
+            Check("vpn endpoint: decoy SNI ignored", fakeProxy.LastTarget == "127.0.0.1:8443");
+        }
+        finally
+        {
+            await server.StopAsync();
+            fakeProxy.Stop();
+        }
+    }
+
     private static async Task LocalProxyAbsoluteFormTest()
     {
         var fakeProxy = new FakeHttpProxy();
@@ -273,6 +375,52 @@ internal static class Program
             var echoed = await ReadExactlyAsync(stream, request.Length, TimeSpan.FromSeconds(10));
             Check("absolute-form request relayed", echoed == request);
             Check("absolute-form CONNECT target", fakeProxy.LastTarget == "example.com:80");
+        }
+        finally
+        {
+            await server.StopAsync();
+            fakeProxy.Stop();
+        }
+    }
+
+    private static async Task UpstreamRejectedTest()
+    {
+        var fakeProxy = new FakeHttpProxy
+        {
+            Status = 407,
+            AuthenticateHeader = "NTLM",
+        };
+        var proxyPort = GetFreePort();
+        fakeProxy.Start(proxyPort);
+
+        var listenPort = GetFreePort();
+        var settings = new ProxySettings
+        {
+            UpstreamHost = "127.0.0.1",
+            UpstreamPort = proxyPort,
+            Username = "alice",
+            Password = "s3cret",
+            ListenPort = listenPort,
+        };
+
+        var logger = new Logger();
+        await using var server = new LocalProxyServer(settings, new BypassList(Array.Empty<string>()), logger, nat: null);
+        await server.StartAsync();
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, listenPort);
+            var stream = client.GetStream();
+
+            var connect = Encoding.ASCII.GetBytes("CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n");
+            await stream.WriteAsync(connect);
+
+            var response = await ReadUntilAsync(stream, "Basic", TimeSpan.FromSeconds(10));
+            Check("407 answered with 502", response.StartsWith("HTTP/1.1 502", StringComparison.Ordinal));
+            Check("407 explains NTLM challenge", response.Contains("NTLM", StringComparison.Ordinal)
+                                                 && response.Contains("Basic", StringComparison.Ordinal));
+            Check("407 status mentioned", response.Contains("(407)", StringComparison.Ordinal));
         }
         finally
         {
@@ -389,6 +537,25 @@ internal static class Program
         return Encoding.ASCII.GetString(buffer, 0, read);
     }
 
+    private static async Task<byte[]> ReadExactlyBytesAsync(NetworkStream stream, int count, TimeSpan timeout)
+    {
+        using var cts = new CancellationTokenSource(timeout);
+        var buffer = new byte[count];
+        var read = 0;
+        while (read < count)
+        {
+            var n = await stream.ReadAsync(buffer.AsMemory(read, count - read), cts.Token);
+            if (n == 0)
+            {
+                break;
+            }
+
+            read += n;
+        }
+
+        return buffer[..read];
+    }
+
     private static int GetFreePort()
     {
         var listener = new TcpListener(IPAddress.Loopback, 0);
@@ -421,6 +588,12 @@ internal static class Program
         public string? LastTarget { get; private set; }
 
         public string? LastAuthorization { get; private set; }
+
+        /// <summary>HTTP status returned to CONNECT (200 echoes the tunnel).</summary>
+        public int Status { get; init; } = 200;
+
+        /// <summary>Optional Proxy-Authenticate value for non-200 responses.</summary>
+        public string? AuthenticateHeader { get; init; }
 
         public void Start(int port)
         {
@@ -463,6 +636,21 @@ internal static class Program
                 var firstLine = headers.Split("\r\n", 2)[0];
                 LastTarget = firstLine.Split(' ').ElementAtOrDefault(1);
                 LastAuthorization = HttpUtil.GetHeader(headers, "Proxy-Authorization");
+
+                if (Status != 200)
+                {
+                    var rejection = new StringBuilder();
+                    rejection.Append($"HTTP/1.1 {Status} Rejected\r\n");
+                    rejection.Append("Content-Length: 0\r\n");
+                    if (!string.IsNullOrEmpty(AuthenticateHeader))
+                    {
+                        rejection.Append("Proxy-Authenticate: ").Append(AuthenticateHeader).Append("\r\n");
+                    }
+
+                    rejection.Append("\r\n");
+                    await stream.WriteAsync(Encoding.ASCII.GetBytes(rejection.ToString()), ct);
+                    return;
+                }
 
                 await stream.WriteAsync(Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\n\r\n"), ct);
 

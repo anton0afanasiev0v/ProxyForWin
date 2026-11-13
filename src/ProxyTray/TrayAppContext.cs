@@ -11,6 +11,8 @@ internal sealed class TrayAppContext : ApplicationContext
     private readonly NotifyIcon _notifyIcon;
     private readonly ToolStripMenuItem _toggleItem;
     private readonly ToolStripMenuItem _statusItem;
+    private readonly ToolStripMenuItem _statsItem;
+    private readonly System.Windows.Forms.Timer _statsTimer;
     private readonly Icon _onIcon;
     private readonly Icon _offIcon;
     private readonly SynchronizationContext? _uiContext;
@@ -28,9 +30,10 @@ internal sealed class TrayAppContext : ApplicationContext
         Directory.CreateDirectory(_dataDir);
 
         _log = new Logger(Path.Combine(_dataDir, "proxy.log"));
-        _store = new SettingsStore(Path.Combine(_dataDir, "settings.json"), new DpapiProtector());
+        _store = new SettingsStore(Path.Combine(_dataDir, "settings.json"), new DpapiProtector(), _log);
 
         var settings = _store.Load();
+        _log.Verbose = settings.VerboseLog;
         var systemProxy = new SystemProxyManager(Path.Combine(_dataDir, "state.json"), _log);
         systemProxy.RestorePending();
 
@@ -42,6 +45,8 @@ internal sealed class TrayAppContext : ApplicationContext
 
         _statusItem = new ToolStripMenuItem("Выключен") { Enabled = false };
         _statusItem.Font = new Font(_statusItem.Font, FontStyle.Bold);
+
+        _statsItem = new ToolStripMenuItem(string.Empty) { Enabled = false, Visible = false };
 
         _toggleItem = new ToolStripMenuItem("Включить");
         _toggleItem.Click += async (_, _) => await ToggleAsync().ConfigureAwait(true);
@@ -60,6 +65,7 @@ internal sealed class TrayAppContext : ApplicationContext
 
         var menu = new ContextMenuStrip();
         menu.Items.Add(_statusItem);
+        menu.Items.Add(_statsItem);
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(_toggleItem);
         menu.Items.Add(settingsItem);
@@ -76,6 +82,12 @@ internal sealed class TrayAppContext : ApplicationContext
             ContextMenuStrip = menu,
         };
         _notifyIcon.DoubleClick += (_, _) => ShowSettings();
+
+        // Counters live outside the UI thread; refreshing them every 2 s is plenty
+        // for a tooltip and avoids pointless work.
+        _statsTimer = new System.Windows.Forms.Timer { Interval = 2_000 };
+        _statsTimer.Tick += (_, _) => UpdateStats();
+        _statsTimer.Start();
 
         _log.Info("ProxyForWin запущен");
         UpdateUi();
@@ -219,11 +231,50 @@ internal sealed class TrayAppContext : ApplicationContext
         _statusItem.Text = _engine.StatusText;
         _toggleItem.Text = running ? "Выключить" : "Включить";
 
-        var upstream = _engine.Settings.HasUpstream ? _engine.Settings.UpstreamEndpoint : "не задан";
+        UpdateStats();
+    }
+
+    /// <summary>
+    /// Refreshes the traffic counters. Called on state changes and every 2 seconds,
+    /// so the tooltip shows live numbers without flooding the UI thread.
+    /// </summary>
+    private void UpdateStats()
+    {
+        if (_notifyIcon is null)
+        {
+            return;
+        }
+
+        var running = _engine.IsRunning;
+        var stats = running ? _engine.StatsText : string.Empty;
+        _statsItem.Text = stats.Length > 0
+            ? $"{_engine.Settings.UpstreamEndpoint} · {stats}"
+            : string.Empty;
+        _statsItem.Visible = stats.Length > 0;
+
         var text = running
-            ? $"ProxyForWin — включён ({upstream})"
+            ? "ProxyForWin — включён" + Environment.NewLine + ShortStats()
             : "ProxyForWin — выключен";
         _notifyIcon.Text = text.Length > 63 ? text[..63] : text;
+    }
+
+    private string ShortStats()
+    {
+        var proxy = _engine.Proxy;
+        if (proxy is null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string> { $"TCP {proxy.TotalConnections}" };
+        if (_engine.Redirector is { } redirector)
+        {
+            parts.Add($"UDP {redirector.DroppedQuic}");
+            parts.Add($"v6 {redirector.DroppedIpv6}");
+            parts.Add($"VPN {redirector.PassedVpnPackets}");
+        }
+
+        return string.Join(" · ", parts);
     }
 
     private void ShowBalloon(string title, string text)
@@ -265,6 +316,8 @@ internal sealed class TrayAppContext : ApplicationContext
     {
         if (disposing)
         {
+            _statsTimer.Stop();
+            _statsTimer.Dispose();
             _engine.Dispose();
             _notifyIcon.Dispose();
             _onIcon.Dispose();

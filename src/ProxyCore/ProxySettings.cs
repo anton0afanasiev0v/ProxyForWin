@@ -48,8 +48,18 @@ public sealed class ProxySettings
     /// <summary>Turn the proxy on automatically when the app starts.</summary>
     public bool EnableOnStartup { get; set; } = false;
 
+    /// <summary>Write DEBUG entries (every connection, every upstream error) to the log file.</summary>
+    public bool VerboseLog { get; set; } = false;
+
     /// <summary>Domains / IPs / CIDRs that always go direct, bypassing the proxy.</summary>
     public List<string> Bypass { get; set; } = new();
+
+    /// <summary>
+    /// VPN servers (IP/CIDR). Their UDP and IPv6 traffic is never blocked, but TCP is
+    /// still redirected into the proxy. Needed for VPN clients that disguise
+    /// themselves as QUIC (UDP/443) or connect over IPv6.
+    /// </summary>
+    public List<string> VpnEndpoints { get; set; } = new();
 
     [JsonIgnore]
     public bool HasUpstream => !string.IsNullOrWhiteSpace(UpstreamHost) && UpstreamPort is > 0 and <= 65535;
@@ -70,6 +80,8 @@ public sealed class ProxySettings
         BlockQuic = true,
         BlockIpv6 = true,
         StartMinimized = true,
+        VerboseLog = false,
+        VpnEndpoints = new List<string>(),
         Bypass = new List<string>
         {
             "localhost",

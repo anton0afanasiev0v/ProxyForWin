@@ -14,11 +14,13 @@ public sealed class SettingsStore
 
     private readonly string _path;
     private readonly ISecretProtector _protector;
+    private readonly Logger? _log;
 
-    public SettingsStore(string path, ISecretProtector protector)
+    public SettingsStore(string path, ISecretProtector protector, Logger? log = null)
     {
         _path = path;
         _protector = protector;
+        _log = log;
     }
 
     public string Path => _path;
@@ -45,16 +47,20 @@ public sealed class SettingsStore
                 {
                     settings.Password = _protector.Unprotect(dto.Password);
                 }
-                catch
+                catch (Exception ex)
                 {
                     settings.Password = string.Empty;
+                    _log?.Warn("Не удалось расшифровать пароль (DPAPI): " + ex.Message +
+                               ". Укажите пароль в настройках заново.");
                 }
             }
 
             return settings;
         }
-        catch
+        catch (Exception ex)
         {
+            _log?.Warn("Не удалось прочитать настройки из " + _path + ": " + ex.Message +
+                       ". Используются значения по умолчанию.");
             return ProxySettings.CreateDefault();
         }
     }
@@ -89,7 +95,9 @@ public sealed class SettingsStore
         public bool RunAtLogon { get; set; }
         public bool StartMinimized { get; set; } = true;
         public bool EnableOnStartup { get; set; }
+        public bool VerboseLog { get; set; }
         public List<string> Bypass { get; set; } = new();
+        public List<string> VpnEndpoints { get; set; } = new();
 
         public ProxySettings ToSettings() => new()
         {
@@ -105,7 +113,9 @@ public sealed class SettingsStore
             RunAtLogon = RunAtLogon,
             StartMinimized = StartMinimized,
             EnableOnStartup = EnableOnStartup,
+            VerboseLog = VerboseLog,
             Bypass = Bypass ?? new List<string>(),
+            VpnEndpoints = VpnEndpoints ?? new List<string>(),
         };
 
         public static SettingsDto FromSettings(ProxySettings s) => new()
@@ -122,7 +132,9 @@ public sealed class SettingsStore
             RunAtLogon = s.RunAtLogon,
             StartMinimized = s.StartMinimized,
             EnableOnStartup = s.EnableOnStartup,
+            VerboseLog = s.VerboseLog,
             Bypass = s.Bypass,
+            VpnEndpoints = s.VpnEndpoints,
         };
     }
 }

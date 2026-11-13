@@ -5,6 +5,40 @@ using System.Text;
 namespace ProxyForWin.Core;
 
 /// <summary>
+/// Thrown when the upstream proxy refuses a CONNECT. Carries the HTTP status and the
+/// <c>Proxy-Authenticate</c> challenge so the UI can explain *why* (bad password vs
+/// an unsupported NTLM/Negotiate scheme).
+/// </summary>
+public sealed class UpstreamProxyException : IOException
+{
+    public UpstreamProxyException(
+        string target,
+        int status,
+        string statusLine,
+        string? authenticateHeader,
+        bool usedAuth,
+        string message)
+        : base(message)
+    {
+        Target = target;
+        Status = status;
+        StatusLine = statusLine;
+        AuthenticateHeader = authenticateHeader;
+        UsedAuth = usedAuth;
+    }
+
+    public string Target { get; }
+
+    public int Status { get; }
+
+    public string StatusLine { get; }
+
+    public string? AuthenticateHeader { get; }
+
+    public bool UsedAuth { get; }
+}
+
+/// <summary>
 /// Opens connections either directly (bypass) or through the upstream HTTP proxy
 /// using the CONNECT method with Proxy-Authorization.
 ///
@@ -16,6 +50,8 @@ public sealed class UpstreamConnector
 {
     public const int BindPortMin = 45000;
     public const int BindPortMax = 45999;
+
+    private static readonly TimeSpan ResponseTimeout = TimeSpan.FromSeconds(30);
 
     private readonly ProxySettings _settings;
     private readonly Logger _log;
@@ -37,6 +73,8 @@ public sealed class UpstreamConnector
         public void Dispose() => Socket.Dispose();
     }
 
+    private sealed record UpstreamResponse(int Status, string StatusLine, string Headers, byte[] Leftover);
+
     public async Task<Tunnel> ConnectAsync(string targetHost, int targetPort, bool useUpstream, CancellationToken ct)
     {
         if (useUpstream)
@@ -50,14 +88,20 @@ public sealed class UpstreamConnector
 
     private async Task<Tunnel> ConnectViaUpstreamAsync(string targetHost, int targetPort, CancellationToken ct)
     {
+        var target = $"{targetHost}:{targetPort}";
+        var usedAuth = !string.IsNullOrEmpty(_settings.Username);
+
+        _log.Debug($"CONNECT {target} через {_settings.UpstreamEndpoint}; " +
+                   $"авторизация: {(usedAuth ? "Basic, логин " + _settings.Username : "не настроена")}");
+
         var socket = await ConnectBoundAsync(_settings.UpstreamHost, _settings.UpstreamPort, ct).ConfigureAwait(false);
         try
         {
             var builder = new StringBuilder();
-            builder.Append("CONNECT ").Append(targetHost).Append(':').Append(targetPort).Append(" HTTP/1.1\r\n");
-            builder.Append("Host: ").Append(targetHost).Append(':').Append(targetPort).Append("\r\n");
+            builder.Append("CONNECT ").Append(target).Append(" HTTP/1.1\r\n");
+            builder.Append("Host: ").Append(target).Append("\r\n");
             builder.Append("Proxy-Connection: Keep-Alive\r\n");
-            if (!string.IsNullOrEmpty(_settings.Username))
+            if (usedAuth)
             {
                 builder.Append("Proxy-Authorization: ")
                     .Append(HttpUtil.BuildBasicAuth(_settings.Username, _settings.Password))
@@ -68,19 +112,64 @@ public sealed class UpstreamConnector
             var request = Encoding.ASCII.GetBytes(builder.ToString());
             await socket.SendAsync(request, SocketFlags.None, ct).ConfigureAwait(false);
 
-            var (status, leftover) = await ReadResponseAsync(socket, ct).ConfigureAwait(false);
-            if (status != 200)
+            UpstreamResponse response;
+            using (var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                throw new IOException($"Upstream proxy answered HTTP {status} for CONNECT {targetHost}:{targetPort}");
+                timeout.CancelAfter(ResponseTimeout);
+                try
+                {
+                    response = await ReadResponseAsync(socket, timeout.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                {
+                    throw new IOException(
+                        $"Upstream {_settings.UpstreamEndpoint} не ответил на CONNECT {target} за " +
+                        $"{ResponseTimeout.TotalSeconds:F0} с");
+                }
             }
 
-            return new Tunnel { Socket = socket, Leftover = leftover };
+            if (response.Status != 200)
+            {
+                throw BuildException(target, response, usedAuth);
+            }
+
+            return new Tunnel { Socket = socket, Leftover = response.Leftover };
         }
         catch
         {
             socket.Dispose();
             throw;
         }
+    }
+
+    private static UpstreamProxyException BuildException(string target, UpstreamResponse response, bool usedAuth)
+    {
+        var challenge = HttpUtil.GetHeader(response.Headers, "Proxy-Authenticate");
+        var offersBasic = challenge is not null &&
+                          challenge.Contains("Basic", StringComparison.OrdinalIgnoreCase);
+        var offersOther = !string.IsNullOrWhiteSpace(challenge) && !offersBasic;
+
+        var message = response.Status switch
+        {
+            407 => usedAuth
+                ? $"Upstream отклонил логин/пароль (407) для {target}."
+                : $"Upstream требует авторизацию (407) для {target}, а логин не задан.",
+            403 => $"Upstream запретил CONNECT на {target} (403). Обычно это ограничение " +
+                   "списка разрешённых портов на прокси-сервере.",
+            502 or 503 or 504 => $"Upstream не смог подключиться к {target} ({response.Status}).",
+            _ => $"Upstream ответил {response.Status} на CONNECT {target}.",
+        };
+
+        if (response.Status == 407 && offersOther)
+        {
+            message += $" Прокси предлагает схему «{challenge}», программа поддерживает только Basic.";
+        }
+        else if (response.Status == 407 && !offersBasic)
+        {
+            message += " Прокси не предложил Basic — вероятно, он требует NTLM/Kerberos.";
+        }
+
+        return new UpstreamProxyException(target, response.Status, response.StatusLine, challenge, usedAuth, message);
     }
 
     private async Task<Socket> ConnectBoundAsync(string host, int port, CancellationToken ct)
@@ -92,13 +181,10 @@ public sealed class UpstreamConnector
         Exception? lastError = null;
         for (var attempt = 0; attempt < 32; attempt++)
         {
-            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
-            {
-                NoDelay = true,
-            };
-
+            var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
             try
             {
+                ConfigureSocket(socket);
                 socket.Bind(new IPEndPoint(IPAddress.Any, NextBindPort()));
             }
             catch (SocketException ex)
@@ -131,6 +217,27 @@ public sealed class UpstreamConnector
         throw new IOException($"Не удалось подключиться к {host}:{port}: {lastError?.Message}", lastError);
     }
 
+    /// <summary>
+    /// Long-lived tunnels (VPN, SSH, websockets) must not be dropped by an idle
+    /// timeout on the upstream proxy, so TCP keep-alive is enabled explicitly.
+    /// </summary>
+    private static void ConfigureSocket(Socket socket)
+    {
+        socket.NoDelay = true;
+
+        try
+        {
+            socket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveTime, 30);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveInterval, 5);
+            socket.SetSocketOption(SocketOptionLevel.Tcp, SocketOptionName.TcpKeepAliveRetryCount, 3);
+        }
+        catch
+        {
+            // Not supported everywhere; keep-alive is a nice-to-have, not a requirement.
+        }
+    }
+
     private int NextBindPort()
     {
         var port = Interlocked.Increment(ref _nextPort);
@@ -143,7 +250,7 @@ public sealed class UpstreamConnector
         return port;
     }
 
-    private static async Task<(int Status, byte[] Leftover)> ReadResponseAsync(Socket socket, CancellationToken ct)
+    private static async Task<UpstreamResponse> ReadResponseAsync(Socket socket, CancellationToken ct)
     {
         var buffer = new byte[8192];
         var total = 0;
@@ -170,7 +277,7 @@ public sealed class UpstreamConnector
 
             var leftover = new byte[total - headerEnd];
             Array.Copy(buffer, headerEnd, leftover, 0, leftover.Length);
-            return (status, leftover);
+            return new UpstreamResponse(status, firstLine, headers, leftover);
         }
 
         throw new IOException("Upstream proxy response headers are too large");

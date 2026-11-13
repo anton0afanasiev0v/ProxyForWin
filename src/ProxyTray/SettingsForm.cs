@@ -20,11 +20,13 @@ internal sealed class SettingsForm : Form
     private readonly RadioButton _modeSystem;
     private readonly RadioButton _modeFull;
     private readonly TextBox _bypassBox;
+    private readonly TextBox _vpnBox;
     private readonly CheckBox _winHttpBox;
     private readonly CheckBox _quicBox;
     private readonly CheckBox _ipv6Box;
     private readonly CheckBox _autostartBox;
     private readonly CheckBox _enableOnStartupBox;
+    private readonly CheckBox _verboseBox;
     private readonly Button _testButton;
     private readonly Label _testResult;
     private readonly Button _saveButton;
@@ -68,11 +70,22 @@ internal sealed class SettingsForm : Form
             PlaceholderText = "example.com" + Environment.NewLine + "*.corp.local" + Environment.NewLine + "10.0.0.0/8",
         };
 
+        _vpnBox = new TextBox
+        {
+            Multiline = true,
+            ScrollBars = ScrollBars.Vertical,
+            Dock = DockStyle.Fill,
+            Height = 70,
+            Text = string.Join(Environment.NewLine, settings.VpnEndpoints),
+            PlaceholderText = "203.0.113.10" + Environment.NewLine + "2001:db8::/32",
+        };
+
         _winHttpBox = new CheckBox { Text = "Настраивать также WinHTTP (службы, Windows Update)", AutoSize = true, Checked = settings.ApplyWinHttp };
         _quicBox = new CheckBox { Text = "Блокировать QUIC (UDP/443), чтобы браузеры работали через TCP", AutoSize = true, Checked = settings.BlockQuic };
         _ipv6Box = new CheckBox { Text = "Блокировать IPv6 в режиме полного перехвата", AutoSize = true, Checked = settings.BlockIpv6 };
         _autostartBox = new CheckBox { Text = "Запускать при входе в Windows (Task Scheduler)", AutoSize = true, Checked = settings.RunAtLogon };
         _enableOnStartupBox = new CheckBox { Text = "Включать прокси сразу при запуске программы", AutoSize = true, Checked = settings.EnableOnStartup };
+        _verboseBox = new CheckBox { Text = "Подробный журнал (каждое соединение и ошибка — в файл proxy.log)", AutoSize = true, Checked = settings.VerboseLog };
 
         _testResult = new Label { AutoSize = true, ForeColor = Color.DimGray, Text = "" };
         _testButton = new Button { Text = "Проверить прокси", AutoSize = true };
@@ -168,12 +181,19 @@ internal sealed class SettingsForm : Form
         bypassPanel.Controls.Add(_bypassBox);
         AddRow(layout, ref row, "Исключения (домены, IP, CIDR — по одному в строке)", bypassPanel);
 
+        var vpnPanel = new Panel { Dock = DockStyle.Fill, MinimumSize = new Size(0, 80) };
+        _vpnBox.Dock = DockStyle.Fill;
+        _vpnBox.MinimumSize = new Size(0, 70);
+        vpnPanel.Controls.Add(_vpnBox);
+        AddRow(layout, ref row, "VPN-серверы (IP/CIDR — UDP и IPv6 не блокируются)", vpnPanel);
+
         var optionsPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, AutoSize = true };
         optionsPanel.Controls.Add(_winHttpBox);
         optionsPanel.Controls.Add(_quicBox);
         optionsPanel.Controls.Add(_ipv6Box);
         optionsPanel.Controls.Add(_autostartBox);
         optionsPanel.Controls.Add(_enableOnStartupBox);
+        optionsPanel.Controls.Add(_verboseBox);
         AddRow(layout, ref row, "Параметры", optionsPanel);
 
         var testPanel = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, AutoSize = true };
@@ -188,7 +208,9 @@ internal sealed class SettingsForm : Form
             ForeColor = Color.DimGray,
             Text = "Пароль хранится в зашифрованном виде (DPAPI). " +
                    "HTTP-прокси передаёт только TCP-соединения: игры и VoIP по UDP через него не пойдут, " +
-                   "поэтому QUIC блокируется, чтобы программы перешли на TCP.",
+                   "поэтому QUIC блокируется, чтобы программы перешли на TCP. " +
+                   "Для Amnezia VPN выберите протокол TCP (XRay/VLESS+Reality или OpenVPN TCP): " +
+                   "UDP/443 (AmneziaWG) блокируется, если адрес сервера не добавлен в «VPN-серверы».",
         };
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         layout.Controls.Add(hint, 0, row);
@@ -241,6 +263,7 @@ internal sealed class SettingsForm : Form
         try
         {
             _store.Save(settings);
+            _log.Verbose = settings.VerboseLog;
             await _engine.ApplyAsync(settings).ConfigureAwait(true);
 
             try
@@ -327,11 +350,9 @@ internal sealed class SettingsForm : Form
         settings.BlockIpv6 = _ipv6Box.Checked;
         settings.RunAtLogon = _autostartBox.Checked;
         settings.EnableOnStartup = _enableOnStartupBox.Checked;
-        settings.Bypass = _bypassBox.Lines
-            .Select(line => line.Trim())
-            .Where(line => line.Length > 0 && !line.StartsWith('#'))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
+        settings.VerboseLog = _verboseBox.Checked;
+        settings.Bypass = ParseLines(_bypassBox);
+        settings.VpnEndpoints = ParseLines(_vpnBox);
 
         if (settings.ListenPort is < 1024 or > 65535)
         {
@@ -347,6 +368,13 @@ internal sealed class SettingsForm : Form
 
         return true;
     }
+
+    private static List<string> ParseLines(TextBox box)
+        => box.Lines
+            .Select(line => line.Trim())
+            .Where(line => line.Length > 0 && !line.StartsWith('#'))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
 
     private static bool IPAddressLooksLocal(string host)
         => host is "127.0.0.1" or "localhost" or "::1";

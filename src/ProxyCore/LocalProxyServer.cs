@@ -39,9 +39,11 @@ public sealed class LocalProxyServer : IAsyncDisposable
 
     private readonly ProxySettings _settings;
     private readonly BypassList _bypass;
+    private readonly BypassList? _vpn;
     private readonly Logger _log;
     private readonly NatTable? _nat;
     private readonly UpstreamConnector _connector;
+    private readonly LogThrottle _errorThrottle = new(TimeSpan.FromSeconds(10));
     private readonly object _sync = new();
 
     private TcpListener? _listener;
@@ -53,10 +55,16 @@ public sealed class LocalProxyServer : IAsyncDisposable
     private long _bytesUp;
     private long _bytesDown;
 
-    public LocalProxyServer(ProxySettings settings, BypassList bypass, Logger log, NatTable? nat)
+    public LocalProxyServer(
+        ProxySettings settings,
+        BypassList bypass,
+        Logger log,
+        NatTable? nat,
+        BypassList? vpn = null)
     {
         _settings = settings;
         _bypass = bypass;
+        _vpn = vpn;
         _log = log;
         _nat = nat;
         _connector = new UpstreamConnector(settings, log);
@@ -187,11 +195,14 @@ public sealed class LocalProxyServer : IAsyncDisposable
         Interlocked.Increment(ref _connections);
         Interlocked.Increment(ref _active);
 
+        ClientRequest? request = null;
         Tunnel? tunnel = null;
+        NetworkStream? stream = null;
+        var connectEstablished = false;
         try
         {
             client.NoDelay = true;
-            using var stream = client.GetStream();
+            stream = client.GetStream();
 
             if (!IsClientAllowed(remote))
             {
@@ -205,36 +216,45 @@ public sealed class LocalProxyServer : IAsyncDisposable
                 return;
             }
 
-            var request = ParseRequest(prefix, remote);
+            request = ParseRequest(prefix, remote);
             if (request is null)
             {
                 _log.Debug($"Не удалось разобрать запрос от {remote}");
                 return;
             }
 
+            // Transparent mode knows only the IP; the real host name (if any) comes
+            // from TLS SNI or the HTTP Host header. Sending the name upstream lets
+            // the proxy resolve it and keeps SNI/name-based ACLs working.
             var hostname = request.Host;
-            if (request.Kind == ClientRequestKind.Transparent && !_bypass.HasDomainRules)
+            if (request.Kind == ClientRequestKind.Transparent && !IsVpnEndpoint(request.Host))
             {
-                hostname = null; // no need to sniff anything
-            }
-            else if (request.Kind == ClientRequestKind.Transparent)
-            {
+                // VPN clients (XRay/Reality, Cloak) deliberately put a decoy name
+                // into SNI. For them the destination IP is authoritative, otherwise
+                // the tunnel would be opened to the decoy site instead of the server.
                 hostname = SniffHostname(prefix) ?? request.Host;
             }
 
             var bypass = IsBypassed(hostname, request.Host);
             var useUpstream = _settings.HasUpstream && !bypass;
 
-            _log.Debug($"{(request.Kind == ClientRequestKind.Transparent ? "transparent" : request.Kind.ToString())} " +
-                       $"{request.Host}:{request.Port} -> {(_settings.UpstreamEndpoint)}" +
-                       (bypass ? " (bypass)" : ""));
+            // Direct connections must use the numeric address from the NAT table;
+            // the sniffed name is only meaningful for the upstream proxy.
+            var targetHost = useUpstream && !string.IsNullOrEmpty(hostname) ? hostname : request.Host!;
 
-            tunnel = await _connector.ConnectAsync(request.Host!, request.Port, useUpstream, ct).ConfigureAwait(false);
+            _log.Debug($"{(request.Kind == ClientRequestKind.Transparent ? "transparent" : request.Kind.ToString())} " +
+                       $"{request.Host}:{request.Port}" +
+                       (targetHost != request.Host ? $" (как {targetHost})" : string.Empty) +
+                       $" -> {(_settings.UpstreamEndpoint)}" +
+                       (bypass ? " (bypass)" : string.Empty));
+
+            tunnel = await _connector.ConnectAsync(targetHost, request.Port, useUpstream, ct).ConfigureAwait(false);
 
             if (request.Kind == ClientRequestKind.Connect)
             {
                 var response = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection Established\r\nProxy-Agent: ProxyForWin\r\n\r\n");
                 await stream.WriteAsync(response, ct).ConfigureAwait(false);
+                connectEstablished = true;
             }
 
             var buffered = request.Kind == ClientRequestKind.Connect
@@ -262,11 +282,28 @@ public sealed class LocalProxyServer : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            _log.Debug("Ошибка обработки соединения: " + ex.Message);
+            if (ex is UpstreamProxyException or IOException)
+            {
+                var key = $"upstream:{request?.Host}:{request?.Port}";
+                if (_errorThrottle.ShouldLog(key))
+                {
+                    _log.Warn(ex.Message);
+                }
+
+                if (request?.Kind == ClientRequestKind.Connect && !connectEstablished)
+                {
+                    await WriteBadGatewayAsync(stream, ex.Message).ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                _log.Debug("Ошибка обработки соединения: " + ex.Message);
+            }
         }
         finally
         {
             tunnel?.Dispose();
+            stream?.Dispose();
             try
             {
                 client.Dispose();
@@ -277,6 +314,34 @@ public sealed class LocalProxyServer : IAsyncDisposable
             }
 
             Interlocked.Decrement(ref _active);
+        }
+    }
+
+    /// <summary>Explains a failed tunnel to CONNECT clients instead of silently closing.</summary>
+    private static async Task WriteBadGatewayAsync(NetworkStream? stream, string message)
+    {
+        if (stream is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var body = Encoding.UTF8.GetBytes("ProxyForWin: " + message + "\r\n");
+            var head = Encoding.ASCII.GetBytes(
+                "HTTP/1.1 502 Bad Gateway\r\n" +
+                "Proxy-Agent: ProxyForWin\r\n" +
+                "Content-Type: text/plain; charset=utf-8\r\n" +
+                "Connection: close\r\n" +
+                $"Content-Length: {body.Length}\r\n\r\n");
+
+            await stream.WriteAsync(head).ConfigureAwait(false);
+            await stream.WriteAsync(body).ConfigureAwait(false);
+            await stream.FlushAsync().ConfigureAwait(false);
+        }
+        catch
+        {
+            // The client may already be gone.
         }
     }
 
@@ -363,6 +428,11 @@ public sealed class LocalProxyServer : IAsyncDisposable
 
         return null;
     }
+
+    private bool IsVpnEndpoint(string? ipHost)
+        => _vpn is not null
+           && IPAddress.TryParse(ipHost, out var ip)
+           && _vpn.MatchesIp(ip);
 
     private bool IsBypassed(string? hostname, string? ipHost)
     {

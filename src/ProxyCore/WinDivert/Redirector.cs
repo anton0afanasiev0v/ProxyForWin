@@ -13,13 +13,19 @@ namespace ProxyForWin.Core.WinDivert;
 ///   proxy L:proxyPort -> R:la becomes inbound R:rp -> L:la        (app sees R:rp)
 /// Correct source/destination ports are preserved; only the addresses and the
 /// destination/source ports are swapped, so TCP sequence numbers stay valid.
+///
+/// The UDP/443 (QUIC) and IPv6 blockers let packets through when the destination is
+/// in the bypass list or in the VPN endpoint list. That is required for VPN clients
+/// (AmneziaWG often runs on UDP/443) and for IPv6-only VPN servers.
 /// </summary>
 public sealed class Redirector : IDisposable
 {
     private readonly Logger _log;
     private readonly NatTable _nat;
     private readonly BypassList _bypass;
+    private readonly BypassList _vpn;
     private readonly ushort _proxyPort;
+    private readonly LogThrottle _blockThrottle = new(TimeSpan.FromSeconds(30));
 
     private readonly IntPtr _tcpHandle = NativeMethods.InvalidHandleValue;
     private readonly IntPtr _udpHandle = NativeMethods.InvalidHandleValue;
@@ -35,12 +41,14 @@ public sealed class Redirector : IDisposable
     private long _redirected;
     private long _droppedUdp;
     private long _droppedIpv6;
+    private long _passedVpn;
 
-    public Redirector(ProxySettings settings, BypassList bypass, NatTable nat, Logger log)
+    public Redirector(ProxySettings settings, BypassList bypass, BypassList vpn, NatTable nat, Logger log)
     {
         _log = log;
         _nat = nat;
         _bypass = bypass;
+        _vpn = vpn;
         _proxyPort = (ushort)settings.ListenPort;
 
         try
@@ -84,6 +92,9 @@ public sealed class Redirector : IDisposable
 
     public long DroppedIpv6 => Interlocked.Read(ref _droppedIpv6);
 
+    /// <summary>UDP/IPv6 packets that were allowed through because of the bypass/VPN lists.</summary>
+    public long PassedVpnPackets => Interlocked.Read(ref _passedVpn);
+
     private IntPtr Open(string filter, string what)
     {
         var handle = NativeMethods.WinDivertOpen(filter, NativeMethods.LayerNetwork, NativeMethods.DefaultPriority, 0);
@@ -119,7 +130,7 @@ public sealed class Redirector : IDisposable
 
         if (_udpHandle != NativeMethods.InvalidHandleValue)
         {
-            var udpThread = new Thread(() => DropLoop(_udpHandle, isUdp: true, _cts.Token))
+            var udpThread = new Thread(() => BlockLoop(_udpHandle, isUdp: true, _cts.Token))
             {
                 IsBackground = true,
                 Name = "ProxyForWin.QuicBlock",
@@ -130,7 +141,7 @@ public sealed class Redirector : IDisposable
 
         if (_ipv6Handle != NativeMethods.InvalidHandleValue)
         {
-            var v6Thread = new Thread(() => DropLoop(_ipv6Handle, isUdp: false, _cts.Token))
+            var v6Thread = new Thread(() => BlockLoop(_ipv6Handle, isUdp: false, _cts.Token))
             {
                 IsBackground = true,
                 Name = "ProxyForWin.Ipv6Block",
@@ -261,6 +272,10 @@ public sealed class Redirector : IDisposable
                 if (IsNewConnection(span))
                 {
                     Interlocked.Increment(ref _redirected);
+                    if (!_log.Verbose && IsNewConnectionToVpn(info.DstAddress))
+                    {
+                        _log.Info($"VPN-сервер {FormatIp(info.DstAddress)}:{info.DstPort} — TCP заворачивается в прокси");
+                    }
                 }
 
                 PacketRewriter.RewriteAppToProxy(span, info, _proxyPort);
@@ -312,9 +327,7 @@ public sealed class Redirector : IDisposable
             return true;
         }
 
-        var bytes = new byte[4];
-        BinaryPrimitives.WriteUInt32BigEndian(bytes, destinationAddress);
-        var ip = new IPAddress(bytes);
+        var ip = ToIp(destinationAddress);
 
         if (IPAddress.IsLoopback(ip))
         {
@@ -324,14 +337,18 @@ public sealed class Redirector : IDisposable
         return _bypass.MatchesIp(ip);
     }
 
-    private void DropLoop(IntPtr handle, bool isUdp, CancellationToken ct)
+    /// <summary>
+    /// UDP/443 and IPv6 blockers: the bypass and VPN lists are allowed through,
+    /// everything else is dropped so applications fall back to TCP.
+    /// </summary>
+    private void BlockLoop(IntPtr handle, bool isUdp, CancellationToken ct)
     {
         var packet = new byte[NativeMethods.MaxPacketSize];
 
         while (!ct.IsCancellationRequested)
         {
             var address = default(WinDivertAddress);
-            if (!NativeMethods.WinDivertRecv(handle, packet, (uint)packet.Length, out _, ref address))
+            if (!NativeMethods.WinDivertRecv(handle, packet, (uint)packet.Length, out var length, ref address))
             {
                 if (ct.IsCancellationRequested)
                 {
@@ -348,17 +365,96 @@ public sealed class Redirector : IDisposable
                 continue;
             }
 
-            // Not resending == dropping.
+            if (TryGetDestination(packet.AsSpan(0, (int)length), out var destination, out var port) &&
+                IsExemptFromBlocking(destination))
+            {
+                Interlocked.Increment(ref _passedVpn);
+                address.Impostor = true;
+                NativeMethods.WinDivertSend(handle, packet, length, out _, ref address);
+                continue;
+            }
+
             if (isUdp)
             {
                 Interlocked.Increment(ref _droppedUdp);
+                if (destination is not null && _blockThrottle.ShouldLog("udp:" + destination))
+                {
+                    _log.Info($"Заблокирован UDP/{port} → {destination}. " +
+                              "Если это VPN-сервер, добавьте его адрес в «VPN-серверы».");
+                }
             }
             else
             {
                 Interlocked.Increment(ref _droppedIpv6);
+                if (destination is not null && _blockThrottle.ShouldLog("v6:" + destination))
+                {
+                    _log.Info($"Заблокирован IPv6 → {destination}. " +
+                              "Если это VPN-сервер, добавьте его адрес в «VPN-серверы».");
+                }
             }
         }
     }
+
+    private bool IsExemptFromBlocking(IPAddress? address)
+    {
+        if (address is null)
+        {
+            return false;
+        }
+
+        return _bypass.MatchesIp(address) || _vpn.MatchesIp(address);
+    }
+
+    private static bool TryGetDestination(ReadOnlySpan<byte> packet, out IPAddress? destination, out ushort port)
+    {
+        destination = null;
+        port = 0;
+
+        if (packet.Length < 20)
+        {
+            return false;
+        }
+
+        var version = packet[0] >> 4;
+        if (version == 4)
+        {
+            var headerLength = (packet[0] & 0x0F) * 4;
+            if (headerLength < 20 || packet.Length < headerLength + 4)
+            {
+                return false;
+            }
+
+            destination = new IPAddress(packet.Slice(16, 4));
+            port = BinaryPrimitives.ReadUInt16BigEndian(packet.Slice(headerLength + 2, 2));
+            return true;
+        }
+
+        if (version == 6)
+        {
+            // IPv6 header: 40 bytes, then TCP/UDP header (ports at +0 and +2).
+            if (packet.Length < 44)
+            {
+                return false;
+            }
+
+            destination = new IPAddress(packet.Slice(24, 16));
+            port = BinaryPrimitives.ReadUInt16BigEndian(packet.Slice(42, 2));
+            return true;
+        }
+
+        return false;
+    }
+
+    private static IPAddress ToIp(uint address)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        BinaryPrimitives.WriteUInt32BigEndian(bytes, address);
+        return new IPAddress(bytes);
+    }
+
+    private static string FormatIp(uint address) => ToIp(address).ToString();
+
+    private bool IsNewConnectionToVpn(uint destinationAddress) => _vpn.MatchesIp(ToIp(destinationAddress));
 
     private static string BuildTcpFilter(ushort proxyPort)
         => "outbound and tcp and not loopback and not impostor and " +
