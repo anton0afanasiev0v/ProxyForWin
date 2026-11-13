@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -42,35 +43,65 @@ public sealed class UpstreamProxyException : IOException
 /// Opens connections either directly (bypass) or through the upstream HTTP proxy
 /// using the CONNECT method with Proxy-Authorization.
 ///
-/// All sockets are bound to a dedicated source-port range (45000-45999). The
-/// WinDivert redirector excludes that range, otherwise the proxy's own upstream
-/// connections would be redirected into the proxy again (an endless loop).
+/// Source ports are ordinary ephemeral ports. Every socket is registered in a
+/// <see cref="SelfConnectionRegistry"/> before it connects, and the WinDivert
+/// redirector lets those exact flows through untouched. A fixed port range was
+/// used before, but Windows (Hyper-V/WSL/Docker) can reserve it and endpoint
+/// security can forbid binds to it — that produced WSAEACCES on bind() and broke
+/// every proxied connection on some machines.
 /// </summary>
 public sealed class UpstreamConnector
 {
-    public const int BindPortMin = 45000;
-    public const int BindPortMax = 45999;
-
+    private const int ConnectAttempts = 3;
     private static readonly TimeSpan ResponseTimeout = TimeSpan.FromSeconds(30);
 
     private readonly ProxySettings _settings;
     private readonly Logger _log;
-    private int _nextPort = Random.Shared.Next(BindPortMin, BindPortMax + 1);
+    private readonly SelfConnectionRegistry _selfConnections;
+    private readonly LogThrottle _connectLogThrottle = new(TimeSpan.FromSeconds(1));
 
-    public UpstreamConnector(ProxySettings settings, Logger log)
+    public UpstreamConnector(
+        ProxySettings settings,
+        Logger log,
+        SelfConnectionRegistry? selfConnections = null)
     {
         _settings = settings;
         _log = log;
+        _selfConnections = selfConnections ?? new SelfConnectionRegistry();
     }
 
     public sealed class Tunnel : IDisposable
     {
-        public required Socket Socket { get; init; }
+        private readonly SelfConnectionRegistry? _registry;
+        private readonly int _localPort;
+        private int _disposed;
+
+        internal Tunnel(Socket socket, byte[]? leftover, SelfConnectionRegistry? registry, int localPort)
+        {
+            Socket = socket;
+            Leftover = leftover ?? Array.Empty<byte>();
+            _registry = registry;
+            _localPort = localPort;
+        }
+
+        public Socket Socket { get; }
 
         /// <summary>Bytes that arrived after the proxy response headers.</summary>
-        public byte[] Leftover { get; init; } = Array.Empty<byte>();
+        public byte[] Leftover { get; }
 
-        public void Dispose() => Socket.Dispose();
+        /// <summary>Local (source) port of this socket, as registered for the redirector.</summary>
+        public int LocalPort => _localPort;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            Socket.Dispose();
+            _registry?.Unregister(_localPort);
+        }
     }
 
     private sealed record UpstreamResponse(int Status, string StatusLine, string Headers, byte[] Leftover);
@@ -82,8 +113,8 @@ public sealed class UpstreamConnector
             return await ConnectViaUpstreamAsync(targetHost, targetPort, ct).ConfigureAwait(false);
         }
 
-        var socket = await ConnectBoundAsync(targetHost, targetPort, ct).ConfigureAwait(false);
-        return new Tunnel { Socket = socket };
+        var (socket, localPort) = await OpenSocketAsync(targetHost, targetPort, ct).ConfigureAwait(false);
+        return new Tunnel(socket, null, _selfConnections, localPort);
     }
 
     private async Task<Tunnel> ConnectViaUpstreamAsync(string targetHost, int targetPort, CancellationToken ct)
@@ -91,10 +122,14 @@ public sealed class UpstreamConnector
         var target = $"{targetHost}:{targetPort}";
         var usedAuth = !string.IsNullOrEmpty(_settings.Username);
 
-        _log.Debug($"CONNECT {target} через {_settings.UpstreamEndpoint}; " +
-                   $"авторизация: {(usedAuth ? "Basic, логин " + _settings.Username : "не настроена")}");
+        if (_connectLogThrottle.ShouldLog(target))
+        {
+            _log.Debug($"CONNECT {target} через {_settings.UpstreamEndpoint}; " +
+                       $"авторизация: {(usedAuth ? "Basic, логин " + _settings.Username : "не настроена")}");
+        }
 
-        var socket = await ConnectBoundAsync(_settings.UpstreamHost, _settings.UpstreamPort, ct).ConfigureAwait(false);
+        var (socket, localPort) = await OpenSocketAsync(_settings.UpstreamHost, _settings.UpstreamPort, ct)
+            .ConfigureAwait(false);
         try
         {
             var builder = new StringBuilder();
@@ -133,11 +168,12 @@ public sealed class UpstreamConnector
                 throw BuildException(target, response, usedAuth);
             }
 
-            return new Tunnel { Socket = socket, Leftover = response.Leftover };
+            return new Tunnel(socket, response.Leftover, _selfConnections, localPort);
         }
         catch
         {
             socket.Dispose();
+            _selfConnections.Unregister(localPort);
             throw;
         }
     }
@@ -172,20 +208,27 @@ public sealed class UpstreamConnector
         return new UpstreamProxyException(target, response.Status, response.StatusLine, challenge, usedAuth, message);
     }
 
-    private async Task<Socket> ConnectBoundAsync(string host, int port, CancellationToken ct)
+    /// <summary>
+    /// Opens a TCP socket on an ephemeral port and registers it so the redirector can
+    /// tell the proxy's own traffic apart from application traffic.
+    /// </summary>
+    private async Task<(Socket Socket, int LocalPort)> OpenSocketAsync(string host, int port, CancellationToken ct)
     {
         var addresses = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
         var address = addresses.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
                       ?? throw new IOException($"Не удалось разрешить {host} в IPv4-адрес");
 
         Exception? lastError = null;
-        for (var attempt = 0; attempt < 32; attempt++)
+        for (var attempt = 0; attempt < ConnectAttempts; attempt++)
         {
             var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+            int localPort;
             try
             {
                 ConfigureSocket(socket);
-                socket.Bind(new IPEndPoint(IPAddress.Any, NextBindPort()));
+                socket.Bind(new IPEndPoint(IPAddress.Any, 0));
+                localPort = ((IPEndPoint)socket.LocalEndPoint!).Port;
+                _selfConnections.Register(localPort, ToUInt32(address), (ushort)port);
             }
             catch (SocketException ex)
             {
@@ -199,22 +242,39 @@ public sealed class UpstreamConnector
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(TimeSpan.FromSeconds(20));
                 await socket.ConnectAsync(new IPEndPoint(address, port), timeout.Token).ConfigureAwait(false);
-                return socket;
+                return (socket, localPort);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
+                _selfConnections.Unregister(localPort);
                 socket.Dispose();
                 throw new IOException($"Таймаут подключения к {host}:{port}");
             }
-            catch (SocketException ex)
+            catch (Exception ex)
             {
+                _selfConnections.Unregister(localPort);
                 socket.Dispose();
                 lastError = ex;
-                break;
+                if (ex is not SocketException)
+                {
+                    throw;
+                }
             }
         }
 
-        throw new IOException($"Не удалось подключиться к {host}:{port}: {lastError?.Message}", lastError);
+        var hint = (lastError as SocketException)?.SocketErrorCode == SocketError.AccessDenied
+            ? " Windows или защитное ПО запрещает такие исходящие подключения."
+            : string.Empty;
+
+        throw new IOException(
+            $"Не удалось подключиться к {host}:{port}: {lastError?.Message}{hint}", lastError);
+    }
+
+    private static uint ToUInt32(IPAddress address)
+    {
+        Span<byte> bytes = stackalloc byte[4];
+        address.TryWriteBytes(bytes, out _);
+        return BinaryPrimitives.ReadUInt32BigEndian(bytes);
     }
 
     /// <summary>
@@ -236,18 +296,6 @@ public sealed class UpstreamConnector
         {
             // Not supported everywhere; keep-alive is a nice-to-have, not a requirement.
         }
-    }
-
-    private int NextBindPort()
-    {
-        var port = Interlocked.Increment(ref _nextPort);
-        if (port > BindPortMax)
-        {
-            Interlocked.CompareExchange(ref _nextPort, BindPortMin - 1, port);
-            port = Interlocked.Increment(ref _nextPort);
-        }
-
-        return port;
     }
 
     private static async Task<UpstreamResponse> ReadResponseAsync(Socket socket, CancellationToken ct)

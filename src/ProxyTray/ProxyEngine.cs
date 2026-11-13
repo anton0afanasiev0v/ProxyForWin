@@ -15,6 +15,7 @@ public sealed class ProxyEngine : IDisposable
     private LocalProxyServer? _proxy;
     private NatTable? _nat;
     private Redirector? _redirector;
+    private SelfConnectionRegistry _selfConnections = new();
     private bool _firewallRuleActive;
 
     public ProxyEngine(ProxySettings settings, SystemProxyManager systemProxy, Logger log)
@@ -114,7 +115,8 @@ public sealed class ProxyEngine : IDisposable
         // the QUIC/IPv6 blockers unless the user actually named them.
         var vpn = new BypassList(settings.VpnEndpoints, includePrivateRanges: false);
         var nat = settings.Mode == ProxyMode.FullTraffic ? new NatTable() : null;
-        var proxy = new LocalProxyServer(settings, bypass, _log, nat, vpn);
+        var selfConnections = new SelfConnectionRegistry();
+        var proxy = new LocalProxyServer(settings, bypass, _log, nat, vpn, selfConnections);
 
         await proxy.StartAsync().ConfigureAwait(false);
 
@@ -124,7 +126,7 @@ public sealed class ProxyEngine : IDisposable
         {
             if (settings.Mode == ProxyMode.FullTraffic)
             {
-                var redirector = new Redirector(settings, bypass, vpn, nat!, _log);
+                var redirector = new Redirector(settings, bypass, vpn, nat!, selfConnections, _log);
                 redirector.Start();
                 _redirector = redirector;
                 FirewallManager.EnsureRule(settings.ListenPort, _log);
@@ -146,6 +148,7 @@ public sealed class ProxyEngine : IDisposable
                 _settings = settings;
                 _proxy = proxy;
                 _nat = nat;
+                _selfConnections = selfConnections;
                 IsRunning = true;
                 ActiveMode = settings.Mode;
             }
@@ -286,7 +289,7 @@ public sealed class ProxyEngine : IDisposable
             throw new InvalidOperationException("Прокси-сервер не задан.");
         }
 
-        var connector = new UpstreamConnector(settings, _log);
+        var connector = new UpstreamConnector(settings, _log, _selfConnections);
         var started = DateTime.UtcNow;
         using var tunnel = await connector.ConnectAsync("www.google.com", 443, useUpstream: true, ct).ConfigureAwait(false);
         return DateTime.UtcNow - started;

@@ -44,6 +44,7 @@ public sealed class LocalProxyServer : IAsyncDisposable
     private readonly NatTable? _nat;
     private readonly UpstreamConnector _connector;
     private readonly LogThrottle _errorThrottle = new(TimeSpan.FromSeconds(10));
+    private readonly LogThrottle _requestLogThrottle = new(TimeSpan.FromSeconds(1));
     private readonly object _sync = new();
 
     private TcpListener? _listener;
@@ -60,14 +61,15 @@ public sealed class LocalProxyServer : IAsyncDisposable
         BypassList bypass,
         Logger log,
         NatTable? nat,
-        BypassList? vpn = null)
+        BypassList? vpn = null,
+        SelfConnectionRegistry? selfConnections = null)
     {
         _settings = settings;
         _bypass = bypass;
         _vpn = vpn;
         _log = log;
         _nat = nat;
-        _connector = new UpstreamConnector(settings, log);
+        _connector = new UpstreamConnector(settings, log, selfConnections);
     }
 
     public bool IsRunning => _listener is not null;
@@ -199,6 +201,7 @@ public sealed class LocalProxyServer : IAsyncDisposable
         Tunnel? tunnel = null;
         NetworkStream? stream = null;
         var connectEstablished = false;
+        var forwardMode = false;
         try
         {
             client.NoDelay = true;
@@ -242,11 +245,25 @@ public sealed class LocalProxyServer : IAsyncDisposable
             // the sniffed name is only meaningful for the upstream proxy.
             var targetHost = useUpstream && !string.IsNullOrEmpty(hostname) ? hostname : request.Host!;
 
-            _log.Debug($"{(request.Kind == ClientRequestKind.Transparent ? "transparent" : request.Kind.ToString())} " +
-                       $"{request.Host}:{request.Port}" +
-                       (targetHost != request.Host ? $" (как {targetHost})" : string.Empty) +
-                       $" -> {(_settings.UpstreamEndpoint)}" +
-                       (bypass ? " (bypass)" : string.Empty));
+            // Plain HTTP (port 80) is sent to the upstream proxy in forward-proxy
+            // form (absolute URI). A CONNECT tunnel to port 80 is refused by many
+            // corporate proxies with 403, while a normal HTTP request is allowed.
+            forwardMode = CanForwardPlainHttp(useUpstream, request, prefix);
+
+            if (_requestLogThrottle.ShouldLog($"{request.Kind}:{request.Host}:{request.Port}"))
+            {
+                _log.Debug($"{(request.Kind == ClientRequestKind.Transparent ? "transparent" : request.Kind.ToString())} " +
+                           $"{request.Host}:{request.Port}" +
+                           (targetHost != request.Host ? $" (как {targetHost})" : string.Empty) +
+                           $" -> {(_settings.UpstreamEndpoint)}" +
+                           (bypass ? " (bypass)" : forwardMode ? " (forward)" : string.Empty));
+            }
+
+            if (forwardMode)
+            {
+                await RelayForwardHttpAsync(stream, prefix, request, hostname, ct).ConfigureAwait(false);
+                return;
+            }
 
             tunnel = await _connector.ConnectAsync(targetHost, request.Port, useUpstream, ct).ConfigureAwait(false);
 
@@ -294,6 +311,10 @@ public sealed class LocalProxyServer : IAsyncDisposable
                 {
                     await WriteBadGatewayAsync(stream, ex.Message).ConfigureAwait(false);
                 }
+                else if (forwardMode && request is not null)
+                {
+                    await WriteBadGatewayAsync(stream, ex.Message).ConfigureAwait(false);
+                }
             }
             else
             {
@@ -315,6 +336,137 @@ public sealed class LocalProxyServer : IAsyncDisposable
 
             Interlocked.Decrement(ref _active);
         }
+    }
+
+    /// <summary>
+    /// Port 80 with a real HTTP request: use the upstream proxy's forward mode
+    /// instead of CONNECT. TLS and other protocols on port 80 still use CONNECT.
+    /// </summary>
+    private static bool CanForwardPlainHttp(bool useUpstream, ClientRequest request, ReadOnlySpan<byte> prefix)
+    {
+        if (!useUpstream || request.Port != 80 || request.Kind == ClientRequestKind.Connect)
+        {
+            return false;
+        }
+
+        if (!HttpUtil.LooksLikeHttpRequest(prefix))
+        {
+            return false;
+        }
+
+        // TLS ClientHello on port 80 — CONNECT is the only option.
+        return !(prefix.Length >= 3 && prefix[0] == 0x16 && prefix[1] == 0x03);
+    }
+
+    /// <summary>
+    /// Forwards one plain HTTP request through the upstream proxy in absolute-URI
+    /// form, adding Proxy-Authorization. The request is forced to
+    /// <c>Connection: close</c>, so a blind relay stays correct for exactly one
+    /// request/response exchange.
+    /// </summary>
+    private async Task RelayForwardHttpAsync(
+        NetworkStream client,
+        byte[] prefix,
+        ClientRequest request,
+        string? hostname,
+        CancellationToken ct)
+    {
+        var headerEnd = HttpUtil.IndexOfHeaderEnd(prefix);
+        if (headerEnd < 0)
+        {
+            throw new IOException("Не удалось разобрать HTTP-запрос.");
+        }
+
+        var head = Encoding.ASCII.GetString(prefix, 0, headerEnd);
+        var lines = head.Split("\r\n");
+        var requestLine = lines[0].Split(' ');
+        if (requestLine.Length < 3)
+        {
+            throw new IOException("Не удалось разобрать строку HTTP-запроса.");
+        }
+
+        var host = string.IsNullOrEmpty(hostname) ? request.Host! : hostname;
+        var authority = FormatAuthority(host, request.Port);
+        var target = requestLine[1];
+        var absolute = target.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+            ? target
+            : $"http://{authority}{(target.StartsWith('/') ? target : "/" + target)}";
+
+        var forwarded = new StringBuilder();
+        forwarded.Append(requestLine[0]).Append(' ').Append(absolute).Append(' ')
+            .Append(string.Join(' ', requestLine[2..])).Append("\r\n");
+
+        var hasHost = false;
+        for (var i = 1; i < lines.Length; i++)
+        {
+            var line = lines[i];
+            var colon = line.IndexOf(':');
+            if (colon <= 0)
+            {
+                continue;
+            }
+
+            var name = line[..colon];
+            if (name.Equals("Proxy-Authorization", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Proxy-Connection", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
+                name.Equals("Keep-Alive", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (name.Equals("Host", StringComparison.OrdinalIgnoreCase))
+            {
+                hasHost = true;
+            }
+
+            forwarded.Append(line).Append("\r\n");
+        }
+
+        if (!hasHost)
+        {
+            forwarded.Append("Host: ").Append(authority).Append("\r\n");
+        }
+
+        if (!string.IsNullOrEmpty(_settings.Username))
+        {
+            forwarded.Append("Proxy-Authorization: ")
+                .Append(HttpUtil.BuildBasicAuth(_settings.Username, _settings.Password))
+                .Append("\r\n");
+        }
+
+        forwarded.Append("Connection: close\r\n\r\n");
+
+        var tunnel = await _connector
+            .ConnectAsync(_settings.UpstreamHost, _settings.UpstreamPort, useUpstream: false, ct)
+            .ConfigureAwait(false);
+        try
+        {
+            using var upstream = new NetworkStream(tunnel.Socket, ownsSocket: false);
+
+            var headBytes = Encoding.ASCII.GetBytes(forwarded.ToString());
+            await upstream.WriteAsync(headBytes, ct).ConfigureAwait(false);
+            Interlocked.Add(ref _bytesUp, headBytes.Length);
+
+            var body = prefix[headerEnd..];
+            if (body.Length > 0)
+            {
+                await upstream.WriteAsync(body, ct).ConfigureAwait(false);
+                Interlocked.Add(ref _bytesUp, body.Length);
+            }
+
+            await RelayAsync(client, upstream, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            tunnel.Dispose();
+        }
+    }
+
+    private static string FormatAuthority(string host, int port)
+    {
+        var name = host.Contains(':') && !host.StartsWith('[') ? $"[{host}]" : host;
+        return port == 80 ? name : $"{name}:{port}";
     }
 
     /// <summary>Explains a failed tunnel to CONNECT clients instead of silently closing.</summary>

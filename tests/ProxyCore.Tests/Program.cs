@@ -19,6 +19,7 @@ internal static class Program
         BypassTests();
         PacketRewriterTests();
         NatTableTests();
+        SelfConnectionRegistryTests();
         SniParserTests();
         LogThrottleTests();
         SettingsStoreTests();
@@ -28,6 +29,7 @@ internal static class Program
         await LocalProxyVpnEndpointTest();
         await LocalProxyAbsoluteFormTest();
         await UpstreamRejectedTest();
+        await SelfConnectionRegistryTunnelTest();
 
         Console.WriteLine();
         Console.WriteLine($"Пройдено: {_passed}, провалено: {_failed}");
@@ -119,6 +121,28 @@ internal static class Program
         Check("nat count", nat.Count == 1);
         nat.Prune(TimeSpan.FromMilliseconds(-1));
         Check("nat pruned", nat.Count == 0);
+    }
+
+    private static void SelfConnectionRegistryTests()
+    {
+        var registry = new SelfConnectionRegistry();
+        registry.Register(51234, ParseIp("203.0.113.9"), 443);
+
+        Check("self port match", registry.Matches(51234, ParseIp("203.0.113.9"), 443));
+        Check("self port wrong address", !registry.Matches(51234, ParseIp("203.0.113.10"), 443));
+        Check("self port wrong destination port", !registry.Matches(51234, ParseIp("203.0.113.9"), 80));
+        Check("self port unknown local port", !registry.Matches(51235, ParseIp("203.0.113.9"), 443));
+        Check("self port count", registry.Count == 1);
+
+        registry.Register(51234, ParseIp("203.0.113.9"), 444);
+        Check("self port re-register replaces", registry.Matches(51234, ParseIp("203.0.113.9"), 444));
+
+        registry.Unregister(51234);
+        Check("self port unregistered", !registry.Matches(51234, ParseIp("203.0.113.9"), 444));
+
+        registry.Register(40000, ParseIp("1.1.1.1"), 443);
+        registry.Prune(TimeSpan.FromMilliseconds(-1));
+        Check("self port pruned", registry.Count == 0);
     }
 
     private static void SniParserTests()
@@ -356,6 +380,8 @@ internal static class Program
         {
             UpstreamHost = "127.0.0.1",
             UpstreamPort = proxyPort,
+            Username = "alice",
+            Password = "s3cret",
             ListenPort = listenPort,
         };
 
@@ -369,18 +395,53 @@ internal static class Program
             await client.ConnectAsync(IPAddress.Loopback, listenPort);
             var stream = client.GetStream();
 
-            const string request = "GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\n\r\n";
+            const string request = "GET /path HTTP/1.1\r\nHost: example.com\r\n\r\n";
             await stream.WriteAsync(Encoding.ASCII.GetBytes(request));
 
-            var echoed = await ReadExactlyAsync(stream, request.Length, TimeSpan.FromSeconds(10));
-            Check("absolute-form request relayed", echoed == request);
-            Check("absolute-form CONNECT target", fakeProxy.LastTarget == "example.com:80");
+            var response = await ReadUntilAsync(stream, "hello", TimeSpan.FromSeconds(10));
+            Check("forward mode answered", response.StartsWith("HTTP/1.1 200", StringComparison.Ordinal));
+            Check("forward mode body relayed", response.Contains("hello", StringComparison.Ordinal));
+            Check("forward absolute-form target", fakeProxy.LastTarget == "http://example.com/path");
+            Check("forward auth header", fakeProxy.LastAuthorization ==
+                                          "Basic " + Convert.ToBase64String(Encoding.UTF8.GetBytes("alice:s3cret")));
+            Check("forward sends Connection close", fakeProxy.LastConnectionClose);
         }
         finally
         {
             await server.StopAsync();
             fakeProxy.Stop();
         }
+    }
+
+    private static async Task SelfConnectionRegistryTunnelTest()
+    {
+        var fakeProxy = new FakeHttpProxy();
+        var proxyPort = GetFreePort();
+        fakeProxy.Start(proxyPort);
+
+        var settings = new ProxySettings
+        {
+            UpstreamHost = "127.0.0.1",
+            UpstreamPort = proxyPort,
+            ListenPort = GetFreePort(),
+        };
+
+        var registry = new SelfConnectionRegistry();
+        var connector = new UpstreamConnector(settings, new Logger(), registry);
+        var tunnel = await connector.ConnectAsync("example.com", 443, useUpstream: true, CancellationToken.None);
+        try
+        {
+            Check("tunnel port registered",
+                registry.Matches(tunnel.LocalPort, ParseIp("127.0.0.1"), (ushort)proxyPort));
+            Check("tunnel registered once", registry.Count == 1);
+        }
+        finally
+        {
+            tunnel.Dispose();
+            fakeProxy.Stop();
+        }
+
+        Check("tunnel unregisters port on dispose", registry.Count == 0);
     }
 
     private static async Task UpstreamRejectedTest()
@@ -589,6 +650,8 @@ internal static class Program
 
         public string? LastAuthorization { get; private set; }
 
+        public bool LastConnectionClose { get; private set; }
+
         /// <summary>HTTP status returned to CONNECT (200 echoes the tunnel).</summary>
         public int Status { get; init; } = 200;
 
@@ -636,6 +699,8 @@ internal static class Program
                 var firstLine = headers.Split("\r\n", 2)[0];
                 LastTarget = firstLine.Split(' ').ElementAtOrDefault(1);
                 LastAuthorization = HttpUtil.GetHeader(headers, "Proxy-Authorization");
+                LastConnectionClose = string.Equals(
+                    HttpUtil.GetHeader(headers, "Connection"), "close", StringComparison.OrdinalIgnoreCase);
 
                 if (Status != 200)
                 {
@@ -649,6 +714,15 @@ internal static class Program
 
                     rejection.Append("\r\n");
                     await stream.WriteAsync(Encoding.ASCII.GetBytes(rejection.ToString()), ct);
+                    return;
+                }
+
+                if (!firstLine.StartsWith("CONNECT ", StringComparison.OrdinalIgnoreCase))
+                {
+                    // Forward-proxy request: answer with a tiny document, as a real
+                    // HTTP proxy would, and close (the client asked for close).
+                    await stream.WriteAsync(Encoding.ASCII.GetBytes(
+                        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"), ct);
                     return;
                 }
 

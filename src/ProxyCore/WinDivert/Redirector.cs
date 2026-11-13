@@ -24,6 +24,7 @@ public sealed class Redirector : IDisposable
     private readonly NatTable _nat;
     private readonly BypassList _bypass;
     private readonly BypassList _vpn;
+    private readonly SelfConnectionRegistry _selfConnections;
     private readonly ushort _proxyPort;
     private readonly LogThrottle _blockThrottle = new(TimeSpan.FromSeconds(30));
 
@@ -43,12 +44,19 @@ public sealed class Redirector : IDisposable
     private long _droppedIpv6;
     private long _passedVpn;
 
-    public Redirector(ProxySettings settings, BypassList bypass, BypassList vpn, NatTable nat, Logger log)
+    public Redirector(
+        ProxySettings settings,
+        BypassList bypass,
+        BypassList vpn,
+        NatTable nat,
+        SelfConnectionRegistry selfConnections,
+        Logger log)
     {
         _log = log;
         _nat = nat;
         _bypass = bypass;
         _vpn = vpn;
+        _selfConnections = selfConnections;
         _proxyPort = (ushort)settings.ListenPort;
 
         try
@@ -151,7 +159,12 @@ public sealed class Redirector : IDisposable
         }
 
         _log.Info("Перехват трафика включён (WinDivert)");
-        _pruneTimer = new Timer(_ => _nat.Prune(TimeSpan.FromMinutes(10)), null, 30_000, 30_000);
+        _pruneTimer = new Timer(_ =>
+        {
+            _nat.Prune(TimeSpan.FromMinutes(10));
+            // Safety net only: tunnels unregister their port on dispose.
+            _selfConnections.Prune(TimeSpan.FromHours(1));
+        }, null, 30_000, 30_000);
     }
 
     public void Stop()
@@ -260,7 +273,7 @@ public sealed class Redirector : IDisposable
         {
             if (!sourceIsProxy && !destinationIsProxy)
             {
-                if (IsExcluded(info.DstAddress, info.DstPort))
+                if (IsExcluded(info))
                 {
                     NativeMethods.WinDivertSend(handle, packet, (uint)length, out _, ref address);
                     return;
@@ -320,14 +333,22 @@ public sealed class Redirector : IDisposable
         return syn && !ack;
     }
 
-    private bool IsExcluded(uint destinationAddress, ushort destinationPort)
+    private bool IsExcluded(in PacketRewriter.TcpInfo info)
     {
-        if (destinationPort == _proxyPort)
+        // Traffic of the proxy's own sockets (upstream CONNECT and direct bypass
+        // connections) must be let through untouched, otherwise it would be
+        // reflected back into the proxy in an endless loop.
+        if (_selfConnections.Matches(info.SrcPort, info.DstAddress, info.DstPort))
         {
             return true;
         }
 
-        var ip = ToIp(destinationAddress);
+        if (info.DstPort == _proxyPort)
+        {
+            return true;
+        }
+
+        var ip = ToIp(info.DstAddress);
 
         if (IPAddress.IsLoopback(ip))
         {
@@ -458,9 +479,7 @@ public sealed class Redirector : IDisposable
 
     private static string BuildTcpFilter(ushort proxyPort)
         => "outbound and tcp and not loopback and not impostor and " +
-           $"tcp.DstPort != {proxyPort} and " +
-           $"(tcp.SrcPort < {UpstreamConnector.BindPortMin} or tcp.SrcPort > {UpstreamConnector.BindPortMax}) and " +
-           $"(tcp.DstPort < {UpstreamConnector.BindPortMin} or tcp.DstPort > {UpstreamConnector.BindPortMax})";
+           $"tcp.DstPort != {proxyPort}";
 
     public void Dispose()
     {
