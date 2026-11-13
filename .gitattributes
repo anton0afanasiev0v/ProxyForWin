@@ -1,0 +1,20 @@
+# Нормализация переводов строк между Windows и Linux.
+* text=auto
+
+# Shell/Makefile должны оставаться LF, иначе bash на Linux падает с $'\r'.
+*.sh   text eol=lf
+*.proj text eol=lf
+
+# Windows-скрипты и файлы решений — CRLF.
+*.cmd      text eol=crlf
+*.bat      text eol=crlf
+*.ps1      text eol=crlf
+*.sln      text eol=crlf
+*.csproj   text eol=crlf
+*.manifest text eol=crlf
+
+# Бинарники не трогаем.
+*.exe binary
+*.dll binary
+*.sys binary
+*.zip binary
